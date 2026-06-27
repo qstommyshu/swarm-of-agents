@@ -8,6 +8,7 @@
     "build": "tsc -p tsconfig.json",
     "start": "node dist/server.js",
     "test": "vitest run tests",
+    "test:e2e": "playwright test",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "migrate": "tsx src/scripts/migrate.ts",
     "verify:public": "tsx src/scripts/verify-public-repos.ts"
@@ -20,6 +21,7 @@
     "zod": "^4.2.1"
   },
   "devDependencies": {
+    "@playwright/test": "^1.61.1",
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^24.10.1",
     "tsx": "^4.21.0",

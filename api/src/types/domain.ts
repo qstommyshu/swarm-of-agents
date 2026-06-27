@@ -279,3 +279,100 @@ export interface WorkspaceGraph extends GraphData {
     summary: string;
   }>;
 }
+
+export type ChatRole = "user" | "assistant";
+
+export type ChatContextSubject =
+  | { type: "node"; id: string }
+  | { type: "edge"; id: string }
+  | { type: "scan"; id: string }
+  | { type: "workspace"; id: string };
+
+export interface ChatCitation {
+  id: string;
+  stableId?: string;
+  label: string;
+  subjectType: "node" | "edge" | "repo" | "workspace";
+  subjectId?: string;
+  repositoryId?: string;
+  scanId?: string;
+  commitSha?: string | null;
+  filePath?: string;
+  lineStart?: number;
+  lineEnd?: number;
+  snippet?: string;
+  detector?: string;
+  confidenceReason?: string;
+  confidence?: Confidence;
+}
+
+export interface ChatSessionRecord {
+  id: string;
+  workspaceId: string;
+  title: string;
+  assistantId: string;
+  threadId?: string | null;
+  selectedNodeId?: string | null;
+  selectedEdgeId?: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ChatMessageRecord {
+  id: string;
+  sessionId: string;
+  role: ChatRole;
+  content: string;
+  context?: ChatContextBundle | null;
+  citations: ChatCitation[];
+  backboardRunId?: string | null;
+  backboardMessageId?: string | null;
+  memoryOperationId?: string | null;
+  memoryError?: string | null;
+  createdAt: string;
+}
+
+export interface ChatContextBundle {
+  workspaceId: string;
+  question: string;
+  graphSummary: {
+    repositories: number;
+    scans: number;
+    nodes: number;
+    edges: number;
+    crossRepoConnections: number;
+  };
+  repositories: Array<{
+    id: string;
+    owner: string;
+    name: string;
+    packageName?: string | null;
+    lastCommitSha?: string | null;
+  }>;
+  selected?: ChatContextSubject;
+  nodes: GraphNode[];
+  edges: GraphLink[];
+  evidence: ChatCitation[];
+  generatedMarkdown: string;
+  previousMessages: Array<{
+    role: ChatRole;
+    content: string;
+    createdAt: string;
+  }>;
+  memoryFacts: string[];
+  weakEvidence: boolean;
+}
+
+export interface BackboardChatResponse {
+  assistantId: string;
+  threadId: string;
+  runId?: string | null;
+  messageId?: string | null;
+  content: string;
+  memoryMode: string;
+  memoryOperationId?: string | null;
+  memoryStatus?: BackboardMemoryStatus | null;
+  memoryError?: string | null;
+  durableFacts?: DurableMemoryFact[];
+  responseJson: unknown;
+}

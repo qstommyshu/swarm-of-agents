@@ -4,7 +4,7 @@ import * as React from "react";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import {
-  ArrowLeft, Search, Maximize2, FileDown, X, ShieldAlert, Plus, Minus,
+  ArrowLeft, Search, Maximize2, FileDown, X, ShieldAlert, Plus, Minus, MessageSquare,
 } from "lucide-react";
 import {
   NODE_KIND_META,
@@ -20,6 +20,7 @@ import {
 } from "@/lib/data";
 import { ATLAS_WORKSPACE_ID, getScan, getScanGraph, getWorkspaceGraph } from "@/lib/api";
 import { Graph3D, type Graph3DHandle } from "@/components/Graph3D";
+import { ChatPanel } from "@/components/ChatPanel";
 import { NodePanel } from "@/components/NodePanel";
 import { LinkPanel } from "@/components/LinkPanel";
 import { Logo, GithubMark, cn } from "@/components/ui";
@@ -47,6 +48,7 @@ function ExplorePageContent() {
 
   const [selectedNodeId, setSelectedNodeId] = React.useState<string | null>(null);
   const [selectedLinkId, setSelectedLinkId] = React.useState<string | null>(null);
+  const [chatOpen, setChatOpen] = React.useState(false);
   const [query, setQuery] = React.useState("");
   const [activeKinds, setActiveKinds] = React.useState<Set<NodeKind>>(new Set(ALL_KINDS));
   const [highRiskOnly, setHighRiskOnly] = React.useState(false);
@@ -334,8 +336,10 @@ function ExplorePageContent() {
       <div className="pointer-events-none absolute inset-x-0 top-0 z-20">
         {/* Primary bar */}
         <div className="pointer-events-auto border-b border-[#2a2c36] bg-[#0c0d10]/90 backdrop-blur-sm">
-          <div className="mx-auto flex h-11 max-w-[1600px] items-center gap-3 px-4">
-            <Logo />
+          <div className="mx-auto flex min-h-11 max-w-[1600px] flex-wrap items-center gap-2 px-3 py-2 sm:h-11 sm:flex-nowrap sm:gap-3 sm:px-4 sm:py-0">
+            <div className="shrink-0">
+              <Logo />
+            </div>
             <div className="h-4 w-px bg-[#2a2c36]" />
             <div className="flex min-w-0 flex-1 items-center gap-1.5 text-[13px] text-[#5c5e6a]">
               {isSystemDetail ? (
@@ -364,14 +368,14 @@ function ExplorePageContent() {
                 </>
               )}
             </div>
-            <div className="ml-auto flex items-center gap-2">
-              <div className="flex items-center gap-1 rounded-lg border border-[#2a2c36] bg-[#181a22]">
+            <div className="flex w-full min-w-0 items-center gap-1.5 sm:ml-auto sm:w-auto sm:justify-end sm:gap-2">
+              <div className="flex min-w-0 flex-1 items-center gap-1 rounded-lg border border-[#2a2c36] bg-[#181a22] sm:flex-none">
                 <Search className="ml-2.5 h-3.5 w-3.5 shrink-0 text-[#5c5e6a]" />
                 <input
                   value={query}
                   onChange={(e) => setQuery(e.target.value)}
                   placeholder="Search nodes…"
-                  className="w-36 bg-transparent py-1.5 pr-2 text-[13px] text-[#e8e9ed] placeholder:text-[#5c5e6a] focus:outline-none sm:w-48"
+                  className="w-full min-w-0 bg-transparent py-1.5 pr-2 text-[13px] text-[#e8e9ed] placeholder:text-[#5c5e6a] focus:outline-none sm:w-48"
                 />
                 {query && (
                   <button onClick={() => setQuery("")} aria-label="Clear" className="cursor-pointer px-1.5 text-[#5c5e6a] hover:text-[#8b8d98]">
@@ -379,7 +383,7 @@ function ExplorePageContent() {
                   </button>
                 )}
               </div>
-              <div className="flex rounded-lg border border-[#2a2c36] bg-[#181a22]">
+              <div className="hidden rounded-lg border border-[#2a2c36] bg-[#181a22] sm:flex">
                 <button
                   onClick={() => graphRef.current?.zoomOut()}
                   aria-label="Zoom out"
@@ -406,6 +410,8 @@ function ExplorePageContent() {
               {scanId ? (
                 <Link
                   href={`/export?scanId=${encodeURIComponent(scanId)}`}
+                  aria-label="Export context"
+                  title="Export context"
                   className="flex cursor-pointer items-center gap-1.5 rounded-lg bg-[#818cf8] px-2.5 py-1.5 text-[13px] font-semibold text-white transition-colors duration-150 hover:bg-[#6366f1]"
                 >
                   <FileDown className="h-3.5 w-3.5" />
@@ -414,12 +420,29 @@ function ExplorePageContent() {
               ) : (
                 <Link
                   href="/"
+                  aria-label="Scan to export"
+                  title="Scan to export"
                   className="flex cursor-pointer items-center gap-1.5 rounded-lg bg-[#818cf8] px-2.5 py-1.5 text-[13px] font-semibold text-white transition-colors duration-150 hover:bg-[#6366f1]"
                 >
                   <FileDown className="h-3.5 w-3.5" />
                   <span className="hidden sm:inline">Scan to export</span>
                 </Link>
               )}
+              <button
+                type="button"
+                aria-label="Open handoff assistant"
+                title="Open handoff assistant"
+                onClick={() => setChatOpen((value) => !value)}
+                className={cn(
+                  "flex cursor-pointer items-center gap-1.5 border px-2.5 py-1.5 text-[13px] font-semibold transition-colors duration-150",
+                  chatOpen
+                    ? "border-[#3b82f6]/40 bg-[#3b82f6]/10 text-[#3b82f6]"
+                    : "border-[#2a2a2a] bg-[#111] text-[#888] hover:text-[#ededed]",
+                )}
+              >
+                <MessageSquare className="h-3.5 w-3.5" />
+                <span className="hidden sm:inline">Handoff</span>
+              </button>
             </div>
           </div>
         </div>
@@ -466,7 +489,7 @@ function ExplorePageContent() {
       </div>
 
       {/* ── Compact side legend ── */}
-      <div className="pointer-events-none absolute left-3 top-28 z-20">
+      <div className="pointer-events-none absolute left-3 top-28 z-20 hidden sm:block">
         <div className="pointer-events-auto w-44 rounded-lg border border-[#2a2c36] bg-[#0c0d10]/90 p-2.5 backdrop-blur-sm">
           <p className="mb-2 font-mono text-[9px] uppercase tracking-[0.14em] text-[#5c5e6a]">Groups</p>
           <div className="space-y-1.5">
@@ -526,8 +549,8 @@ function ExplorePageContent() {
 
       {/* ── Bottom-center hint ── */}
       {!panelOpen && (
-        <div className="pointer-events-none absolute bottom-4 left-1/2 z-20 -translate-x-1/2">
-          <div className="rounded-lg border border-[#2a2c36] bg-[#0c0d10]/80 px-3.5 py-2 font-mono text-[12px] text-[#5c5e6a] backdrop-blur-sm">
+        <div className="pointer-events-none absolute bottom-4 left-1/2 z-20 w-[calc(100vw-24px)] max-w-xl -translate-x-1/2">
+          <div className="rounded-lg border border-[#2a2c36] bg-[#0c0d10]/80 px-3.5 py-2 text-center font-mono text-[12px] text-[#5c5e6a] backdrop-blur-sm">
               {apiNotice ?? (selectedNodeId
               ? "↑ parent  ↓ next dep  dbl-click sub-graph  Esc deselect"
               : isSystemDetail
@@ -539,7 +562,7 @@ function ExplorePageContent() {
 
       {/* ── Stats ── */}
       <div className={cn(
-        "pointer-events-none absolute right-3 top-28 z-10 transition-opacity duration-200",
+        "pointer-events-none absolute right-3 top-28 z-10 hidden transition-opacity duration-200 sm:block",
         panelOpen && "opacity-0",
       )}>
         <div className="rounded-lg border border-[#2a2c36] bg-[#0c0d10]/90 p-3 backdrop-blur-sm">
@@ -560,8 +583,11 @@ function ExplorePageContent() {
 
       {/* ── Right detail panel ── */}
       {panelOpen && (
-        <div className="absolute right-0 top-0 z-30 h-full w-full max-w-[400px] border-l border-[#2a2c36]">
-          <div className="h-full overflow-hidden rounded-l-xl bg-[#181a22] animate-slide-right">
+        <div
+          data-testid="detail-panel"
+          className="absolute inset-x-2 bottom-2 top-auto z-30 h-[45dvh] border border-[#2a2c36] sm:inset-x-auto sm:right-0 sm:top-20 sm:h-[calc(100%-5rem)] sm:w-full sm:max-w-[400px] sm:border-y-0 sm:border-r-0 sm:border-l"
+        >
+          <div className="h-full overflow-hidden rounded-xl bg-[#181a22] animate-slide-right sm:rounded-l-xl sm:rounded-r-none">
             {selectedNode && (
               <NodePanel
                 node={selectedNode}
@@ -587,6 +613,20 @@ function ExplorePageContent() {
           </div>
         </div>
       )}
+
+      <ChatPanel
+        open={chatOpen}
+        scanId={scanId}
+        selectedNode={selectedNode}
+        selectedLink={selectedLink}
+        detailsOpen={panelOpen}
+        onClose={() => setChatOpen(false)}
+        onSelectNode={(id) => {
+          selectNode(id);
+          graphRef.current?.focusNode(id);
+        }}
+        onSelectLink={selectLink}
+      />
     </main>
   );
 }

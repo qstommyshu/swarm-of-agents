@@ -3,6 +3,13 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { loadConfig } from "../src/config.js";
+import { buildChatContext, formatCitationList } from "../src/chat/context.js";
+import {
+  buildChatDurableMemoryFacts,
+  buildChatPrompt,
+  enforceEvidencePolicy,
+  extractDurableMemoryFacts,
+} from "../src/backboard/client.js";
 import { AtlasRepository, migrate, openDatabase, type SqliteDatabase } from "../src/db/database.js";
 import { BackboardClient, buildDurableMemoryFacts } from "../src/backboard/client.js";
 import { buildWorkspaceGraph } from "../src/graph/workspace.js";
@@ -12,7 +19,16 @@ import { parseGitHubRepo, repoUrlSchema } from "../src/github/url.js";
 import { scanRepository } from "../src/scanner/scanner.js";
 import { buildApp } from "../src/server/app.js";
 import { ScanService } from "../src/server/scan-service.js";
-import type { BackboardSynthesis, GraphData, RepositoryRecord } from "../src/types/domain.js";
+import { ChatService, type ChatBackboardLike } from "../src/server/chat-service.js";
+import type {
+  BackboardChatResponse,
+  BackboardMemoryStatus,
+  BackboardSynthesis,
+  ChatContextBundle,
+  DurableMemoryFact,
+  GraphData,
+  RepositoryRecord,
+} from "../src/types/domain.js";
 import { compactForPrompt, redactSecrets } from "../src/util/redact.js";
 
 const fixtureRoot = path.resolve("tests/fixtures/sample-js");
@@ -50,6 +66,32 @@ function repoRecord(id = "repo_fixture", packageName = "@atlas/sample-service"):
     createdAt: new Date(0).toISOString(),
     updatedAt: new Date(0).toISOString(),
   };
+}
+
+async function seedCompletedScan(repository: AtlasRepository): Promise<{ repo: RepositoryRecord; graph: GraphData }> {
+  repository.ensureWorkspace("test");
+  const repo = repository.upsertRepository({
+    id: "repo_fixture",
+    workspaceId: "test",
+    owner: "atlas",
+    name: "sample-service",
+    url: "https://github.com/atlas/sample-service",
+    cloneUrl: "https://github.com/atlas/sample-service.git",
+    packageName: "@atlas/sample-service",
+    lastCommitSha: "abc1234",
+  });
+  const scan = repository.createScan({
+    id: "scan_fixture",
+    workspaceId: "test",
+    repositoryId: repo.id,
+    repoUrl: repo.url,
+  });
+  const artifacts = await scanRepository(fixtureRoot, { maxFiles: 100, maxFileBytes: 100_000 });
+  const graph = buildGraphFromArtifacts({ repository: repo, commitSha: "abc1234", artifacts, backboard: fakeBackboard() });
+  const context = buildScanContext({ repository: repo, graph, commitSha: "abc1234" });
+  repository.replaceGraphRows({ workspaceId: "test", repositoryId: repo.id, scanId: scan.id, graph });
+  repository.completeScan({ scanId: scan.id, commitSha: "abc1234", graph, context, artifacts, backboard: fakeBackboard() });
+  return { repo, graph };
 }
 
 describe("repo URL validation", () => {
@@ -267,6 +309,50 @@ describe("SQLite persistence", () => {
       | undefined;
     expect(evidenceRow?.stable_id).toBeTruthy();
   });
+
+  it("indexes only explicit evidence-backed Backboard memory facts, never request summaries", async () => {
+    const repo = repository.upsertRepository({
+      id: "repo_fixture",
+      workspaceId: "test",
+      owner: "atlas",
+      name: "sample-service",
+      url: "https://github.com/atlas/sample-service",
+      cloneUrl: "https://github.com/atlas/sample-service.git",
+      packageName: "@atlas/sample-service",
+      lastCommitSha: "abc1234",
+    });
+    const artifacts = await scanRepository(fixtureRoot, { maxFiles: 100, maxFileBytes: 100_000 });
+    const durableFacts = buildDurableMemoryFacts({ repository: repo, commitSha: "abc1234", artifacts });
+
+    repository.recordBackboard({
+      workspaceId: "test",
+      repositoryId: repo.id,
+      backboard: {
+        ...fakeBackboard(),
+        memoryOperationId: "mem_safe",
+        durableFacts,
+      },
+      requestSummary: "chat chat_unsafe: Does payroll-service own customer SSNs?",
+    });
+    repository.recordBackboard({
+      workspaceId: "test",
+      repositoryId: repo.id,
+      backboard: {
+        ...fakeBackboard(),
+        memoryOperationId: "mem_prompt_only",
+        durableFacts: [],
+      },
+      requestSummary: "chat chat_prompt_only: Speculative unsupported user prompt",
+    });
+
+    const facts = repository.listBackboardMemoryFacts("test");
+    const serialized = JSON.stringify(facts);
+    expect(facts.length).toBeGreaterThan(0);
+    expect(serialized).toContain("evidence");
+    expect(serialized).toContain("mem_safe");
+    expect(serialized).not.toContain("payroll-service owns customer SSNs");
+    expect(serialized).not.toContain("Speculative unsupported user prompt");
+  });
 });
 
 describe("Backboard payload safety", () => {
@@ -336,6 +422,592 @@ describe("Backboard payload safety", () => {
 
     expect(requestBodies[0].memory).toBe("Off");
     expect(String(requestBodies[1].content)).toContain("evidence-indexed facts");
+  });
+
+  it("treats scan memory writes without an operation id as auditable failures", async () => {
+    const artifacts = await scanRepository(fixtureRoot, { maxFiles: 100, maxFileBytes: 100_000 });
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/threads/messages")) {
+        return new Response(JSON.stringify({ thread_id: "thread_test", run_id: "run_test", content: "{}" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      if (url.endsWith("/assistants/asst_test/memories")) {
+        return new Response(JSON.stringify({ accepted: true }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response(JSON.stringify({ id: "unexpected" }), { status: 200 });
+    }) as typeof fetch;
+
+    try {
+      const client = new BackboardClient(
+        loadConfig({
+          backboardApiKey: "test-key",
+          backboardApiBase: "https://backboard.test",
+          backboardMemoryMode: "Auto",
+        }),
+      );
+      const result = await client.synthesizeScan({
+        assistantId: "asst_test",
+        repository: repoRecord(),
+        commitSha: "abc1234",
+        artifacts,
+      });
+
+      expect(result.memoryStatus?.attempted).toBe(true);
+      expect(result.memoryStatus?.succeeded).toBe(false);
+      expect(result.memoryStatus?.operationId).toBeNull();
+      expect(result.memoryStatus?.error).toMatch(/memory operation id/i);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+describe("handoff chat backend", () => {
+  let tempDir: string;
+  let db: SqliteDatabase;
+  let repository: AtlasRepository;
+
+  class RecordingBackboard implements ChatBackboardLike {
+    createCalls = 0;
+    chatCalls: Array<{
+      assistantId: string;
+      threadId?: string | null;
+      sessionId: string;
+      workspaceId: string;
+      question: string;
+      context: ChatContextBundle;
+    }> = [];
+
+    async createAssistant(): Promise<string> {
+      this.createCalls += 1;
+      return "asst_handoff";
+    }
+
+    async chat(args: {
+      assistantId: string;
+      threadId?: string | null;
+      sessionId: string;
+      workspaceId: string;
+      question: string;
+      context: ChatContextBundle;
+    }): Promise<BackboardChatResponse> {
+      this.chatCalls.push(args);
+      const citation = args.context.evidence[0]?.id ?? "E1";
+      const node = args.context.nodes[0]?.label ?? "the selected component";
+      const content = [
+        `Direct answer: a takeover engineer should inspect service ${node} first. [${citation}]`,
+        `Supporting evidence: [${citation}]`,
+        "Confidence: confirmed",
+        `Handoff notes: service ${node} is the next concrete inspection target. [${citation}]`,
+      ].join("\n");
+      return {
+        assistantId: args.assistantId,
+        threadId: args.threadId ?? "thread_handoff",
+        runId: "run_handoff",
+        messageId: "msg_handoff",
+        content,
+        memoryMode: "Auto",
+        memoryOperationId: "mem_handoff",
+        durableFacts: buildChatDurableMemoryFacts({
+          workspaceId: args.workspaceId,
+          sessionId: args.sessionId,
+          content,
+          context: args.context,
+        }),
+        responseJson: { ok: true },
+      };
+    }
+
+    async syncChatMemory(): Promise<BackboardMemoryStatus> {
+      return { attempted: true, succeeded: true, operationId: "mem_sync", factCount: 1 };
+    }
+  }
+
+  beforeEach(async () => {
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "atlas-chat-"));
+    db = openDatabase(path.join(tempDir, "atlas.db"));
+    migrate(db);
+    repository = new AtlasRepository(db);
+    await seedCompletedScan(repository);
+  });
+
+  afterEach(async () => {
+    db.close();
+    await fs.rm(tempDir, { recursive: true, force: true });
+  });
+
+  it("creates chat sessions, reuses the workspace assistant, and stores handoff answers", async () => {
+    const backboard = new RecordingBackboard();
+    const service = new ChatService(
+      loadConfig({
+        rootDir: tempDir,
+        databaseUrl: `file:${path.join(tempDir, "atlas.db")}`,
+        databasePath: path.join(tempDir, "atlas.db"),
+        workspaceId: "test",
+        backboardApiKey: "test",
+      }),
+      repository,
+      backboard,
+    );
+
+    const first = await service.createSession({});
+    const second = await service.createSession({});
+    expect(first.assistantId).toBe("asst_handoff");
+    expect(second.assistantId).toBe("asst_handoff");
+    expect(backboard.createCalls).toBe(1);
+
+    const result = await service.sendMessage(first.id, {
+      content: "What should a new developer know before taking over this repo?",
+      scanId: "scan_fixture",
+    });
+
+    expect(result.assistantMessage.content).toContain("takeover engineer");
+    expect(result.assistantMessage.citations.length).toBeGreaterThan(0);
+    expect(result.session.threadId).toBe("thread_handoff");
+    expect(repository.countTable("chat_sessions")).toBe(2);
+    expect(repository.countTable("chat_messages")).toBe(2);
+    expect(repository.countTable("backboard_records")).toBeGreaterThan(0);
+  });
+
+  it("retrieves selected graph context and formats evidence citations", () => {
+    const graph = repository.getScan("scan_fixture")!.graph!;
+    const selectedNode = graph.nodes.find((node) => node.kind === "database") ?? graph.nodes[0];
+    const context = buildChatContext({
+      repository,
+      workspaceId: "test",
+      question: "What should I inspect before changing database handoff work?",
+      nodeId: selectedNode.id,
+    });
+
+    expect(context.nodes.some((node) => node.id === selectedNode.id)).toBe(true);
+    expect(context.evidence.length).toBeGreaterThan(0);
+    expect(context.evidence[0].stableId).toBeTruthy();
+    expect(context.evidence[0].commitSha).toBe("abc1234");
+    expect(context.generatedMarkdown).toContain("Evidence Citations");
+    expect(formatCitationList(context.evidence)).toContain("[E1]");
+  });
+
+  it("constructs Backboard handoff prompts with secrets redacted", () => {
+    const context = buildChatContext({
+      repository,
+      workspaceId: "test",
+      question: "Before I change this module, what should I verify?",
+      scanId: "scan_fixture",
+    });
+    const rawSecret = "sk_test_123456789012345678901234567890123456";
+    const prompt = buildChatPrompt({
+      question: `handoff with API_KEY=${rawSecret}`,
+      context: {
+        ...context,
+        generatedMarkdown: `${context.generatedMarkdown}\nTOKEN=${rawSecret}`,
+      },
+      maxChars: 100_000,
+    });
+
+    expect(prompt).toContain("codebase handoff assistant");
+    expect(prompt).not.toContain(rawSecret);
+    expect(prompt).toContain("[REDACTED]");
+  });
+
+  it("does not inject speculative user prompts as known Backboard memory facts", () => {
+    repository.recordBackboard({
+      workspaceId: "test",
+      backboard: {
+        ...fakeBackboard(),
+        memoryOperationId: "mem_prompt_only",
+        durableFacts: [],
+      },
+      requestSummary: "chat chat_speculative: Does payroll-service own customer SSNs?",
+    });
+
+    const context = buildChatContext({
+      repository,
+      workspaceId: "test",
+      question: "What known facts should a handoff reuse?",
+      scanId: "scan_fixture",
+    });
+
+    expect(JSON.stringify(context.memoryFacts)).not.toContain("payroll-service");
+    expect(context.generatedMarkdown).not.toContain("payroll-service");
+    expect(context.generatedMarkdown).toContain("No stored memory facts are locally indexed yet");
+  });
+
+  it("injects evidence-backed chat memory facts into future handoff context", async () => {
+    const backboard = new RecordingBackboard();
+    const service = new ChatService(
+      loadConfig({
+        rootDir: tempDir,
+        databaseUrl: `file:${path.join(tempDir, "atlas.db")}`,
+        databasePath: path.join(tempDir, "atlas.db"),
+        workspaceId: "test",
+        backboardApiKey: "test",
+      }),
+      repository,
+      backboard,
+    );
+    const session = await service.createSession({});
+    await service.sendMessage(session.id, {
+      content: "What should a new developer inspect before taking over this repo?",
+      scanId: "scan_fixture",
+    });
+
+    const context = buildChatContext({
+      repository,
+      workspaceId: "test",
+      question: "What known handoff facts can I reuse?",
+      scanId: "scan_fixture",
+    });
+
+    expect(context.memoryFacts.some((fact) => fact.includes("Handoff notes") || fact.includes("takeover engineer"))).toBe(true);
+    expect(context.memoryFacts.every((fact) => fact.includes("evidence") && fact.includes("mem_handoff"))).toBe(true);
+    expect(context.generatedMarkdown).toContain("Known Backboard Memory Facts");
+  });
+
+  it("extracts only evidence-backed durable handoff memory facts", () => {
+    const context = buildChatContext({
+      repository,
+      workspaceId: "test",
+      question: "What handoff risk matters?",
+      scanId: "scan_fixture",
+    });
+    const facts = extractDurableMemoryFacts(
+      [
+        "- service queue-eventing is a handoff risk to inspect. [E1]",
+        "- maybe there is a hidden owner with no evidence.",
+        "- uncertain: the payment path may call a private API. [E2]",
+      ].join("\n"),
+      context,
+    );
+
+    expect(facts).toHaveLength(1);
+    expect(facts[0]).toContain("queue-eventing");
+  });
+
+  it("does not create durable memory facts from uncited answers or unknown citations", () => {
+    const context = buildChatContext({
+      repository,
+      workspaceId: "test",
+      question: "What handoff risk matters?",
+      scanId: "scan_fixture",
+    });
+
+    expect(extractDurableMemoryFacts("The database module is risky for handoff.", context)).toHaveLength(0);
+    expect(extractDurableMemoryFacts("The database module is risky for handoff. [E999]", context)).toHaveLength(0);
+    expect(
+      buildChatDurableMemoryFacts({
+        workspaceId: "test",
+        sessionId: "chat_test",
+        content: "The database module is risky for handoff.",
+        context,
+      }),
+    ).toHaveLength(0);
+  });
+
+  it("marks missing evidence answers uncertain instead of hallucinating", () => {
+    const context: ChatContextBundle = {
+      workspaceId: "test",
+      question: "Who owns the unreleased migration?",
+      graphSummary: { repositories: 0, scans: 0, nodes: 0, edges: 0, crossRepoConnections: 0 },
+      repositories: [],
+      selected: { type: "workspace", id: "test" },
+      nodes: [],
+      edges: [],
+      evidence: [],
+      generatedMarkdown: "No matching context.",
+      previousMessages: [],
+      memoryFacts: [],
+      weakEvidence: true,
+    };
+
+    const answer = enforceEvidencePolicy("The migration owner is the platform team.", context);
+    expect(answer).toContain("I do not have evidence for that in the scanned repos yet.");
+    expect(answer).toContain("uncertain");
+  });
+
+  it("drops unsupported factual claims in no-evidence contexts even if the refusal sentence is present", () => {
+    const context: ChatContextBundle = {
+      workspaceId: "test",
+      question: "Who owns sensitive payroll data?",
+      graphSummary: { repositories: 0, scans: 0, nodes: 0, edges: 0, crossRepoConnections: 0 },
+      repositories: [],
+      selected: { type: "workspace", id: "test" },
+      nodes: [],
+      edges: [],
+      evidence: [],
+      generatedMarkdown: "No matching context.",
+      previousMessages: [],
+      memoryFacts: [],
+      weakEvidence: true,
+    };
+
+    const answer = enforceEvidencePolicy(
+      "Direct answer: payroll-service owns customer SSNs.\n\nI do not have evidence for that in the scanned repos yet.",
+      context,
+    );
+
+    expect(answer).toContain("I do not have evidence for that in the scanned repos yet.");
+    expect(answer).toContain("unsupported architecture claims in the model output were ignored");
+    expect(answer).not.toContain("payroll-service owns customer SSNs");
+    expect(answer).not.toContain("Direct answer:");
+  });
+
+  it("marks uncited Backboard answers as ungrounded instead of attaching supporting citations", () => {
+    const context = buildChatContext({
+      repository,
+      workspaceId: "test",
+      question: "What should I know before changing this module?",
+      scanId: "scan_fixture",
+    });
+
+    const answer = enforceEvidencePolicy("The database module is the safest first change.", context);
+
+    expect(answer).toContain("did not cite a valid evidence ID");
+    expect(answer).toContain("not supporting proof");
+    expect(answer).not.toContain("Supporting evidence:");
+    expect(extractDurableMemoryFacts(answer, context)).toHaveLength(0);
+  });
+
+  it("marks answers with only unknown citations as unverified", () => {
+    const context = buildChatContext({
+      repository,
+      workspaceId: "test",
+      question: "Is the database module safe?",
+      scanId: "scan_fixture",
+    });
+
+    const answer = enforceEvidencePolicy("The database module is safe. [E999]", context);
+
+    expect(answer).toContain("Confidence: uncertain");
+    expect(answer).toContain("Invalid citations ignored: [E999]");
+    expect(answer).toContain("not supporting proof");
+    expect(answer).not.toContain("database module is safe");
+    expect(answer).not.toContain("confirmed by retrieved scan evidence");
+    expect(extractDurableMemoryFacts(answer, context)).toHaveLength(0);
+  });
+
+  it("does not preserve confident unsupported direct answers when only citations are unknown", () => {
+    const context = buildChatContext({
+      repository,
+      workspaceId: "test",
+      question: "Who owns SSNs?",
+      scanId: "scan_fixture",
+    });
+
+    const answer = enforceEvidencePolicy("Direct answer: payroll-service is confirmed as the SSN owner. [E999]", context);
+
+    expect(answer).toContain("Direct answer: I cannot verify that claim from the retrieved scan evidence.");
+    expect(answer).toContain("Invalid citations ignored: [E999]");
+    expect(answer).toContain("unsupported architecture claims in the model output were ignored");
+    expect(answer).not.toContain("payroll-service is confirmed as the SSN owner");
+    expect(answer).not.toContain("is confirmed");
+    expect(answer).not.toContain("SSN owner");
+    expect(answer).not.toContain("grounded");
+    expect(extractDurableMemoryFacts(answer, context)).toHaveLength(0);
+  });
+
+  it("removes preexisting confirmed confidence when only unknown citations are present", () => {
+    const context = buildChatContext({
+      repository,
+      workspaceId: "test",
+      question: "Is the database module safe?",
+      scanId: "scan_fixture",
+    });
+
+    const answer = enforceEvidencePolicy(
+      "The database module is safe. [E999]\n\nConfidence: confirmed by retrieved scan evidence.",
+      context,
+    );
+
+    expect(answer).toContain("Confidence: uncertain");
+    expect(answer).toContain("Invalid citations ignored: [E999]");
+    expect(answer).toContain("unverified");
+    expect(answer).not.toContain("database module is safe");
+    expect(answer).not.toContain("confirmed by retrieved scan evidence");
+    expect(answer).not.toContain("grounded");
+    expect(extractDurableMemoryFacts(answer, context)).toHaveLength(0);
+  });
+
+  it("flags mixed valid and unknown citations without global confirmed confidence", () => {
+    const context = buildChatContext({
+      repository,
+      workspaceId: "test",
+      question: "What database risk should a handoff mention?",
+      scanId: "scan_fixture",
+    });
+
+    const answer = enforceEvidencePolicy("The database module is a handoff risk. [E1] [E999]", context);
+
+    expect(answer).toContain("Citation warning");
+    expect(answer).toContain("unknown citations ignored: [E999]");
+    expect(answer).toContain("Only known retrieved citations are accepted as evidence: [E1]");
+    expect(answer).toContain("partially supported by known scan evidence only");
+    expect(answer).not.toContain("confirmed by retrieved scan evidence");
+    expect(extractDurableMemoryFacts(answer, context)).toHaveLength(0);
+  });
+
+  it("serves the chat API routes with persisted assistant messages", async () => {
+    const backboard = new RecordingBackboard();
+    const app = await buildApp({
+      config: loadConfig({
+        rootDir: tempDir,
+        databaseUrl: `file:${path.join(tempDir, "atlas.db")}`,
+        databasePath: path.join(tempDir, "atlas.db"),
+        workspaceId: "test",
+        backboardApiKey: "test",
+      }),
+      repository,
+      chatService: new ChatService(
+        loadConfig({
+          rootDir: tempDir,
+          databaseUrl: `file:${path.join(tempDir, "atlas.db")}`,
+          databasePath: path.join(tempDir, "atlas.db"),
+          workspaceId: "test",
+          backboardApiKey: "test",
+        }),
+        repository,
+        backboard,
+      ),
+    });
+
+    const sessionResponse = await app.inject({
+      method: "POST",
+      url: "/api/chat/sessions",
+      payload: { title: "PR handoff" },
+    });
+    expect(sessionResponse.statusCode).toBe(201);
+    const session = sessionResponse.json() as { id: string; assistantId: string };
+    expect(session.assistantId).toBe("asst_handoff");
+
+    const messageResponse = await app.inject({
+      method: "POST",
+      url: `/api/chat/sessions/${session.id}/messages`,
+      payload: {
+        content: "What should a new developer inspect before taking over this unfinished PR?",
+        scanId: "scan_fixture",
+      },
+    });
+    expect(messageResponse.statusCode).toBe(201);
+    expect(messageResponse.json().assistantMessage.content).toContain("Handoff notes");
+
+    const listResponse = await app.inject({
+      method: "GET",
+      url: `/api/chat/sessions/${session.id}/messages`,
+    });
+    expect(listResponse.statusCode).toBe(200);
+    expect(listResponse.json().messages).toHaveLength(2);
+
+    await app.close();
+  });
+
+  it("protects chat API routes when optional API auth is configured", async () => {
+    const backboard = new RecordingBackboard();
+    const authedConfig = loadConfig({
+      rootDir: tempDir,
+      databaseUrl: `file:${path.join(tempDir, "atlas.db")}`,
+      databasePath: path.join(tempDir, "atlas.db"),
+      workspaceId: "test",
+      backboardApiKey: "test",
+      apiAuthToken: "chat-secret",
+    });
+    const app = await buildApp({
+      config: authedConfig,
+      repository,
+      chatService: new ChatService(authedConfig, repository, backboard),
+    });
+    const auth = { authorization: "Bearer chat-secret" };
+
+    const missingSession = await app.inject({
+      method: "POST",
+      url: "/api/chat/sessions",
+      payload: { title: "Protected PR handoff" },
+    });
+    expect(missingSession.statusCode).toBe(401);
+
+    const invalidSession = await app.inject({
+      method: "POST",
+      url: "/api/chat/sessions",
+      headers: { authorization: "Bearer wrong" },
+      payload: { title: "Protected PR handoff" },
+    });
+    expect(invalidSession.statusCode).toBe(401);
+
+    const sessionResponse = await app.inject({
+      method: "POST",
+      url: "/api/chat/sessions",
+      headers: auth,
+      payload: { title: "Protected PR handoff" },
+    });
+    expect(sessionResponse.statusCode).toBe(201);
+    const session = sessionResponse.json() as { id: string };
+
+    const missingGet = await app.inject({
+      method: "GET",
+      url: `/api/chat/sessions/${session.id}`,
+    });
+    expect(missingGet.statusCode).toBe(401);
+
+    const getSession = await app.inject({
+      method: "GET",
+      url: `/api/chat/sessions/${session.id}`,
+      headers: auth,
+    });
+    expect(getSession.statusCode).toBe(200);
+
+    const missingMessage = await app.inject({
+      method: "POST",
+      url: `/api/chat/sessions/${session.id}/messages`,
+      payload: {
+        content: "What should a new developer inspect before taking over?",
+        scanId: "scan_fixture",
+      },
+    });
+    expect(missingMessage.statusCode).toBe(401);
+
+    const messageResponse = await app.inject({
+      method: "POST",
+      url: `/api/chat/sessions/${session.id}/messages`,
+      headers: auth,
+      payload: {
+        content: "What should a new developer inspect before taking over?",
+        scanId: "scan_fixture",
+      },
+    });
+    expect(messageResponse.statusCode).toBe(201);
+
+    const missingMessages = await app.inject({
+      method: "GET",
+      url: `/api/chat/sessions/${session.id}/messages`,
+    });
+    expect(missingMessages.statusCode).toBe(401);
+
+    const listMessages = await app.inject({
+      method: "GET",
+      url: `/api/chat/sessions/${session.id}/messages`,
+      headers: auth,
+    });
+    expect(listMessages.statusCode).toBe(200);
+
+    const missingMemorySync = await app.inject({
+      method: "POST",
+      url: `/api/chat/sessions/${session.id}/memory-sync`,
+    });
+    expect(missingMemorySync.statusCode).toBe(401);
+
+    const memorySync = await app.inject({
+      method: "POST",
+      url: `/api/chat/sessions/${session.id}/memory-sync`,
+      headers: auth,
+    });
+    expect(memorySync.statusCode).toBe(202);
+
+    await app.close();
   });
 });
 

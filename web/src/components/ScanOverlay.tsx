@@ -74,7 +74,7 @@ export function ScanOverlay({ repo, scanId }: { repo: string; scanId?: string | 
   const failed = status === "failed";
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-[#0c0d10]/90 px-4 backdrop-blur-sm">
+    <div data-testid="scan-overlay" className="fixed inset-0 z-50 flex items-center justify-center bg-[#0c0d10]/90 px-4 backdrop-blur-sm">
       <div className="w-full max-w-xl border border-[#2a2c36] bg-[#181a22] rounded-xl animate-fade-in">
         {/* Header */}
         <div className="flex items-center justify-between border-b border-[#2a2c36] px-4 py-3">

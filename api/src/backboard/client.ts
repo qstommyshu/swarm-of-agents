@@ -1,5 +1,13 @@
 import type { AtlasConfig } from "../config.js";
-import type { BackboardMemoryStatus, BackboardSynthesis, DurableMemoryFact, RepositoryRecord, ScanArtifacts } from "../types/domain.js";
+import type {
+  BackboardChatResponse,
+  BackboardMemoryStatus,
+  BackboardSynthesis,
+  ChatContextBundle,
+  DurableMemoryFact,
+  RepositoryRecord,
+  ScanArtifacts,
+} from "../types/domain.js";
 import { compactForPrompt, redactSecrets } from "../util/redact.js";
 import { stableId } from "../util/ids.js";
 
@@ -13,6 +21,7 @@ interface BackboardMessageResponse {
   id?: string;
   message_id?: string;
   thread_id?: string;
+  thread?: { id?: string };
   run_id?: string;
   content?: unknown;
   message?: { content?: unknown; id?: string };
@@ -132,6 +141,47 @@ export function buildDurableMemoryFacts(args: {
   return facts;
 }
 
+export function buildChatDurableMemoryFacts(args: {
+  workspaceId: string;
+  sessionId: string;
+  content: string;
+  context: ChatContextBundle;
+}): DurableMemoryFact[] {
+  const factTexts = extractDurableMemoryFacts(args.content, args.context);
+  if (factTexts.length === 0 || args.context.evidence.length === 0) return [];
+
+  const repoById = new Map(args.context.repositories.map((repo) => [repo.id, `${repo.owner}/${repo.name}`]));
+  return factTexts.flatMap((factText) => {
+    const citedIds = Array.from(factText.matchAll(/\[(E\d+)\]/g)).map((match) => match[1]);
+    if (citedIds.length === 0) return [];
+    const citations = args.context.evidence.filter((citation) => citedIds.includes(citation.id));
+    const validCitations = citations.filter((citation) => citation?.filePath && citation.lineStart);
+    if (validCitations.length === 0) return [];
+
+    const primary = validCitations[0];
+    const repositoryId = primary.repositoryId ?? args.context.repositories[0]?.id ?? args.workspaceId;
+    const commitSha = primary.commitSha ?? "unknown";
+    return [{
+      id: stableId("memory-fact", "chat", args.workspaceId, args.sessionId, commitSha, factText),
+      scope: "finding",
+      repositoryId,
+      repo: repoById.get(repositoryId) ?? `workspace/${args.workspaceId}`,
+      commitSha,
+      fact: factText,
+      confidence: primary.confidence ?? (args.context.weakEvidence ? "inferred" : "confirmed"),
+      evidenceIds: validCitations.map((citation) => citation.stableId ?? citation.id),
+      evidenceRefs: validCitations.map((citation) => ({
+        evidenceId: citation.stableId ?? citation.id,
+        filePath: citation.filePath ?? "unknown",
+        lineStart: citation.lineStart ?? 1,
+        lineEnd: citation.lineEnd ?? citation.lineStart ?? 1,
+        detector: citation.detector ?? "chat-context",
+        snippet: redactSecrets(citation.snippet ?? "").slice(0, 700),
+      })),
+    }];
+  });
+}
+
 export class BackboardClient {
   constructor(private readonly config: AtlasConfig) {}
 
@@ -166,7 +216,7 @@ export class BackboardClient {
     const body: Record<string, unknown> = {
       name: `Atlas workspace ${workspaceId}`,
       system_prompt:
-        "You are Atlas' architecture analysis assistant. Use deterministic scan artifacts as source of truth. Do not invent nodes or edges without evidence. Persist reusable repo knowledge in memory.",
+        "You are Atlas' codebase handoff assistant. Help new developers and AI agents take over unfinished work using deterministic scan artifacts as source of truth. Do not invent nodes or edges without evidence. Persist reusable repo, system, and task handoff knowledge in memory.",
       metadata: {
         product: "atlas",
         workspaceId,
@@ -268,6 +318,80 @@ ${compactForPrompt(compactArtifacts, this.config.scanMaxPromptChars)}`;
     };
   }
 
+  async chat(args: {
+    assistantId: string;
+    threadId?: string | null;
+    sessionId: string;
+    workspaceId: string;
+    question: string;
+    context: ChatContextBundle;
+  }): Promise<BackboardChatResponse> {
+    const prompt = buildChatPrompt({
+      question: args.question,
+      context: args.context,
+      maxChars: this.config.scanMaxPromptChars,
+    });
+
+    const body: Record<string, unknown> = {
+      assistant_id: args.assistantId,
+      role: "user",
+      content: prompt,
+      memory: this.config.backboardMemoryMode,
+      metadata: {
+        product: "atlas",
+        workspaceId: args.workspaceId,
+        chatSessionId: args.sessionId,
+        selected: args.context.selected,
+      },
+    };
+    if (args.threadId) body.thread_id = args.threadId;
+
+    const response = await this.request<BackboardMessageResponse>("/threads/messages", body);
+    const threadId = response.thread_id ?? (typeof response.thread === "object" && response.thread && "id" in response.thread ? String(response.thread.id) : undefined);
+    if (!threadId) throw new Error("Backboard message response did not include a thread id");
+    const rawContent = asText(response.content ?? response.message?.content ?? response.output ?? response);
+    const content = enforceEvidencePolicy(rawContent, args.context);
+    const memory = await this.addChatMemorySafe({
+      assistantId: args.assistantId,
+      workspaceId: args.workspaceId,
+      sessionId: args.sessionId,
+      content,
+      context: args.context,
+    });
+    const durableFacts = memory.operationId
+      ? buildChatDurableMemoryFacts({
+          workspaceId: args.workspaceId,
+          sessionId: args.sessionId,
+          content,
+          context: args.context,
+        })
+      : [];
+
+    return {
+      assistantId: args.assistantId,
+      threadId,
+      runId: response.run_id ?? null,
+      messageId: response.message_id ?? response.message?.id ?? response.id ?? null,
+      content,
+      memoryMode: this.config.backboardMemoryMode,
+      memoryOperationId: memory.operationId ?? null,
+      memoryStatus: memory,
+      memoryError: memory.error ?? null,
+      durableFacts,
+      responseJson: response,
+    };
+  }
+
+  async syncChatMemory(args: {
+    assistantId: string;
+    workspaceId: string;
+    sessionId: string;
+    content: string;
+    context: ChatContextBundle;
+  }): Promise<BackboardMemoryStatus> {
+    return this.addChatMemorySafe(args);
+  }
+
   private async addMemorySafe(args: {
     assistantId: string;
     repository: RepositoryRecord;
@@ -300,10 +424,19 @@ ${compactForPrompt(compactArtifacts, this.config.scanMaxPromptChars)}`;
         },
       });
       const id = response.id ?? response.memory_id ?? response.operation_id;
+      if (typeof id !== "string") {
+        return {
+          attempted: true,
+          succeeded: false,
+          operationId: null,
+          error: "Backboard memory response did not include a memory operation id.",
+          factCount: args.facts.length,
+        };
+      }
       return {
         attempted: true,
         succeeded: true,
-        operationId: typeof id === "string" ? id : null,
+        operationId: id,
         factCount: args.facts.length,
       };
     } catch (error) {
@@ -316,4 +449,202 @@ ${compactForPrompt(compactArtifacts, this.config.scanMaxPromptChars)}`;
       };
     }
   }
+
+  private async addChatMemorySafe(args: {
+    assistantId: string;
+    workspaceId: string;
+    sessionId: string;
+    content: string;
+    context: ChatContextBundle;
+  }): Promise<BackboardMemoryStatus> {
+    const facts = buildChatDurableMemoryFacts(args);
+    if (facts.length === 0) {
+      return {
+        attempted: false,
+        succeeded: false,
+        operationId: null,
+        error: "No evidence-backed durable handoff facts were extracted for memory.",
+        factCount: 0,
+      };
+    }
+    try {
+      const response = await this.request<Record<string, unknown>>(`/assistants/${args.assistantId}/memories`, {
+        content: compactForPrompt(
+          {
+            purpose:
+              "Durable Atlas handoff knowledge for future human and AI-agent takeover. Store only these evidence-indexed facts; do not infer additional architecture.",
+            workspaceId: args.workspaceId,
+            chatSessionId: args.sessionId,
+            facts,
+          },
+          12_000,
+        ),
+        metadata: {
+          product: "atlas",
+          workspaceId: args.workspaceId,
+          chatSessionId: args.sessionId,
+          factCount: facts.length,
+          evidenceIndexed: true,
+          evidenceIds: facts.flatMap((fact) => fact.evidenceIds),
+          commits: Array.from(new Set(facts.map((fact) => fact.commitSha).filter(Boolean))),
+          repositories: Array.from(new Set(facts.map((fact) => fact.repositoryId).filter(Boolean))),
+        },
+      });
+      const id = response.id ?? response.memory_id ?? response.operation_id;
+      if (typeof id === "string") {
+        return {
+          attempted: true,
+          succeeded: true,
+          operationId: id,
+          factCount: facts.length,
+        };
+      }
+      return {
+        attempted: true,
+        succeeded: false,
+        operationId: null,
+        error: "Backboard memory response did not include a memory operation id.",
+        factCount: facts.length,
+      };
+    } catch (error) {
+      return {
+        attempted: true,
+        succeeded: false,
+        operationId: null,
+        error: error instanceof Error ? error.message : "Backboard memory write failed for an evidence-backed handoff fact.",
+        factCount: facts.length,
+      };
+    }
+  }
+}
+
+export function buildChatPrompt(args: {
+  question: string;
+  context: ChatContextBundle;
+  maxChars: number;
+}): string {
+  const safeQuestion = redactSecrets(args.question);
+  const safeContext = redactSecrets(args.context.generatedMarkdown);
+  const compactContext = compactForPrompt(safeContext, args.maxChars);
+  return `You are Atlas' evidence-grounded codebase handoff assistant for a scanned workspace.
+
+Your job is to help a new developer or AI agent take over work in a large enterprise codebase, especially after an unfinished PR or partially completed task. Answer the user's handoff question using only the deterministic Atlas context below plus durable Backboard memory for this same assistant. Do not invent services, dependencies, APIs, queues, databases, repositories, owners, task state, or risks.
+
+Architecture and handoff claims must include evidence citations like [E1] that correspond to the Evidence Citations section. If the context has no supporting evidence for the user's question, say exactly: "I do not have evidence for that in the scanned repos yet."
+
+When relevant, use this structure:
+- Direct answer
+- Supporting evidence
+- Confidence
+- Handoff notes
+- Related nodes/edges to inspect next
+- Suggested next drill-down question
+
+If evidence is weak, mark the answer inferred or uncertain and say what a takeover engineer should verify next. Do not mention secrets or raw env values.
+
+Graph summary:
+${JSON.stringify(args.context.graphSummary, null, 2)}
+
+Previous chat messages:
+${JSON.stringify(args.context.previousMessages, null, 2)}
+
+User question:
+${safeQuestion}
+
+${compactContext}`;
+}
+
+function neutralizeUnsupportedConfidence(content: string): string {
+  return content
+    .split(/\r?\n/)
+    .filter((line) => {
+      if (!/^\s*Confidence\s*:/i.test(line)) return true;
+      return !/(confirmed|grounded|retrieved scan evidence|verified|evidence-backed|supported by)/i.test(line);
+    })
+    .join("\n")
+    .replace(/\bconfirmed by retrieved scan evidence\b/gi, "not verified by retrieved scan evidence")
+    .replace(/\bgrounded\b/gi, "not verified")
+    .replace(/\bevidence-backed\b/gi, "not verified")
+    .trim();
+}
+
+export function enforceEvidencePolicy(content: string, context: ChatContextBundle): string {
+  let trimmed = content.trim();
+  const citedIds = Array.from(trimmed.matchAll(/\[(E\d+)\]/g)).map((match) => match[1]);
+  const knownCitationIds = new Set(context.evidence.map((citation) => citation.id));
+  const validCitedIds = citedIds.filter((citationId) => knownCitationIds.has(citationId));
+  const invalidCitedIds = citedIds.filter((citationId) => !knownCitationIds.has(citationId));
+  const hasCitation = citedIds.length > 0;
+  const hasValidCitation = validCitedIds.length > 0;
+  const hasNoEvidence = trimmed.includes("I do not have evidence for that in the scanned repos yet.");
+  if (context.evidence.length === 0) {
+    return [
+      "I do not have evidence for that in the scanned repos yet.",
+      "",
+      "Confidence: uncertain. No retrieved scan evidence was available, so unsupported architecture claims in the model output were ignored.",
+    ].join("\n");
+  }
+  if (context.evidence.length > 0 && hasCitation && !hasValidCitation && !hasNoEvidence) {
+    const citationIds = context.evidence.slice(0, 3).map((citation) => `[${citation.id}]`).join(" ");
+    trimmed = "Direct answer: I cannot verify that claim from the retrieved scan evidence.";
+    trimmed = `${trimmed}\n\nConfidence: uncertain and unverified. The answer cited only unknown evidence IDs, so unsupported architecture claims in the model output were ignored.`;
+    trimmed = `${trimmed}\n\nRetrieved context to inspect, not supporting proof for the answer: ${citationIds}.`;
+    trimmed = `${trimmed}\n\nInvalid citations ignored: ${invalidCitedIds.map((citationId) => `[${citationId}]`).join(" ")}.`;
+  } else if (context.evidence.length > 0 && !hasCitation && !hasNoEvidence) {
+    const citationIds = context.evidence.slice(0, 3).map((citation) => `[${citation.id}]`).join(" ");
+    trimmed = neutralizeUnsupportedConfidence(trimmed);
+    trimmed = `${trimmed}\n\nConfidence: uncertain. Retrieved scan context exists, but this answer did not cite a valid evidence ID, so treat architectural claims as unverified.`;
+    trimmed = `${trimmed}\n\nRetrieved context to inspect, not supporting proof for the answer: ${citationIds}.`;
+  } else if (context.evidence.length > 0 && invalidCitedIds.length > 0 && hasValidCitation && !hasNoEvidence) {
+    const invalidList = invalidCitedIds.map((citationId) => `[${citationId}]`).join(" ");
+    const validList = validCitedIds.map((citationId) => `[${citationId}]`).join(" ");
+    trimmed = neutralizeUnsupportedConfidence(trimmed);
+    trimmed = `${trimmed}\n\nCitation warning: unknown citations ignored: ${invalidList}. Only known retrieved citations are accepted as evidence: ${validList}.`;
+    if (/\bconfidence\b/i.test(trimmed)) {
+      trimmed = `${trimmed}\n\nConfidence correction: partially supported by known scan evidence only; unknown citations are not evidence.`;
+    } else {
+      trimmed = `${trimmed}\n\nConfidence: partially supported by known scan evidence only; unknown citations are not evidence.`;
+    }
+  } else if (context.weakEvidence && !/\b(inferred|uncertain|weak evidence)\b/i.test(trimmed)) {
+    trimmed = `${trimmed}\n\nConfidence: inferred from limited evidence.`;
+  }
+  if (context.evidence.length > 0 && hasValidCitation && invalidCitedIds.length === 0 && !/\bconfidence\b/i.test(trimmed)) {
+    trimmed = `${trimmed}\n\nConfidence: ${context.weakEvidence ? "inferred from limited evidence" : "confirmed by retrieved scan evidence"}.`;
+  }
+  const firstCitation = hasValidCitation ? `[${validCitedIds[0]}]` : "";
+  if (context.selected?.type === "node" && !/\bRelated nodes\/edges\b/i.test(trimmed)) {
+    const node = context.nodes.find((item) => item.id === context.selected?.id);
+    if (node) {
+      trimmed = `${trimmed}\n\nRelated nodes/edges to inspect next: ${node.label} (${node.kind}) ${firstCitation}.`;
+    }
+  }
+  if (context.selected?.type === "edge" && !/\bRelated nodes\/edges\b/i.test(trimmed)) {
+    const edge = context.edges.find((item) => item.id === context.selected?.id);
+    if (edge) {
+      trimmed = `${trimmed}\n\nRelated nodes/edges to inspect next: ${edge.source} -> ${edge.target} (${edge.kind} connection) ${firstCitation}.`;
+    }
+  }
+  return trimmed;
+}
+
+export function extractDurableMemoryFacts(content: string, context: ChatContextBundle): string[] {
+  if (context.evidence.length === 0) return [];
+  const knownCitationIds = new Set(context.evidence.map((citation) => citation.id));
+  const lines = content
+    .split(/\r?\n/)
+    .map((line) => line.replace(/^[-*]\s*/, "").trim())
+    .filter(Boolean);
+  const architectureWords = /(service|module|repo|repository|api|queue|topic|database|db|dependency|depends|calls|imports|edge|connection|risk|before you change|contract)/i;
+  const unsupportedWords = /(do not have evidence|uncertain|weak evidence|guess|speculat|no evidence|unsupported|ungrounded|retrieved context|not supporting proof|related nodes\/edges)/i;
+  const facts: string[] = [];
+  for (const line of lines) {
+    if (!architectureWords.test(line)) continue;
+    if (unsupportedWords.test(line)) continue;
+    const citedIds = Array.from(line.matchAll(/\[(E\d+)\]/g)).map((match) => match[1]);
+    if (citedIds.length === 0) continue;
+    if (citedIds.some((citationId) => !knownCitationIds.has(citationId))) continue;
+    facts.push(redactSecrets(line).slice(0, 700));
+    if (facts.length >= 5) break;
+  }
+  return facts;
 }

@@ -6,6 +6,7 @@ import { AtlasRepository } from "../db/database.js";
 import { buildWorkspaceGraph } from "../graph/workspace.js";
 import { repoUrlSchema } from "../github/url.js";
 import type { ScanContext } from "../types/domain.js";
+import { ChatService } from "./chat-service.js";
 import { ScanService } from "./scan-service.js";
 
 const createScanSchema = z.object({
@@ -30,6 +31,24 @@ const edgeParamsSchema = z.object({
   edgeId: z.string().min(1),
 });
 
+const chatSessionParamsSchema = z.object({
+  sessionId: z.string().min(1),
+});
+
+const createChatSessionSchema = z.object({
+  workspaceId: z.string().trim().min(1).optional(),
+  title: z.string().trim().min(1).max(120).optional(),
+  selectedNodeId: z.string().trim().min(1).nullable().optional(),
+  selectedEdgeId: z.string().trim().min(1).nullable().optional(),
+});
+
+const createChatMessageSchema = z.object({
+  content: z.string().trim().min(1).max(12_000),
+  nodeId: z.string().trim().min(1).nullable().optional(),
+  edgeId: z.string().trim().min(1).nullable().optional(),
+  scanId: z.string().trim().min(1).nullable().optional(),
+});
+
 function contextFiles(context: ScanContext) {
   return [
     { path: "system-brief.md", markdown: context.systemBrief },
@@ -44,6 +63,7 @@ export async function buildApp(args: {
   config: AtlasConfig;
   repository: AtlasRepository;
   scanService?: ScanService;
+  chatService?: ChatService;
 }): Promise<FastifyInstance> {
   const app = Fastify({
     logger: {
@@ -53,6 +73,7 @@ export async function buildApp(args: {
   });
 
   const scanService = args.scanService ?? new ScanService(args.config, args.repository);
+  const chatService = args.chatService ?? new ChatService(args.config, args.repository);
 
   await app.register(cors, {
     origin: args.config.corsOrigin ?? true,
@@ -166,6 +187,42 @@ export async function buildApp(args: {
       files,
       combinedMarkdown: files.map((file) => `\n\n<!-- ===== ${file.path} ===== -->\n\n${file.markdown}`).join("\n"),
     };
+  });
+
+  app.post("/api/chat/sessions", { preHandler: requireAuth }, async (request, reply) => {
+    const parsed = createChatSessionSchema.parse(request.body);
+    const session = await chatService.createSession(parsed);
+    reply.status(201).send(session);
+  });
+
+  app.get("/api/chat/sessions/:sessionId", { preHandler: requireAuth }, async (request, reply) => {
+    const { sessionId } = chatSessionParamsSchema.parse(request.params);
+    const session = chatService.getSession(sessionId);
+    if (!session) return reply.status(404).send({ error: "Not Found", message: "Chat session not found" });
+    return session;
+  });
+
+  app.get("/api/chat/sessions/:sessionId/messages", { preHandler: requireAuth }, async (request, reply) => {
+    const { sessionId } = chatSessionParamsSchema.parse(request.params);
+    const session = chatService.getSession(sessionId);
+    if (!session) return reply.status(404).send({ error: "Not Found", message: "Chat session not found" });
+    return {
+      sessionId,
+      messages: chatService.listMessages(sessionId),
+    };
+  });
+
+  app.post("/api/chat/sessions/:sessionId/messages", { preHandler: requireAuth }, async (request, reply) => {
+    const { sessionId } = chatSessionParamsSchema.parse(request.params);
+    const parsed = createChatMessageSchema.parse(request.body);
+    const result = await chatService.sendMessage(sessionId, parsed);
+    reply.status(201).send(result);
+  });
+
+  app.post("/api/chat/sessions/:sessionId/memory-sync", { preHandler: requireAuth }, async (request, reply) => {
+    const { sessionId } = chatSessionParamsSchema.parse(request.params);
+    const result = await chatService.syncMemory(sessionId);
+    reply.status(202).send(result);
   });
 
   return app;

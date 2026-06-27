@@ -2,16 +2,17 @@
 
 Atlas is a hackathon prototype for understanding inherited codebases before you change them.
 
-Paste a GitHub repo URL and Atlas turns the system into a navigable 3D graph: services, modules, databases, queues, auth layers, config surfaces, and external APIs. The goal is to help engineers build a mental model quickly, then export the same structured context for AI agents.
+Paste a GitHub repo URL and Atlas turns the system into a navigable 3D graph: services, modules, databases, queues, auth layers, config surfaces, and external APIs. The goal is to help engineers and AI agents build a grounded handoff model quickly, especially when work is inherited from an unfinished PR or partially completed task.
 
 The current demo uses a fictional `acme/payments-platform` bank payments system to show the intended product flow.
 
 ## What It Does
 
-Atlas is built around one scan and two outputs:
+Atlas is built around one scan and three outputs:
 
 - A human-readable 3D system map for exploration.
 - An agent-ready context package with markdown files for every node, link, and system brief.
+- An evidence-grounded handoff assistant that answers takeover questions using graph evidence and Backboard workspace memory.
 
 The graph is not just a dependency chart. Nodes explain what each part owns, why it exists, how confident the scan is, and where the risk is. Edges are first-class too: clicking a connection shows the code path, contract, failure behavior, criticality, confidence, and "before you change this" notes.
 
@@ -23,7 +24,8 @@ The graph is not just a dependency chart. Nodes explain what each part owns, why
 4. Filter by node type, search by keyword, or focus on high-risk areas.
 5. Click a node to inspect ownership, dependencies, dependents, confidence, and risk flags.
 6. Click an edge to inspect the actual connection between two parts of the system.
-7. Export the generated context package for agents or future handoff.
+7. Open the Handoff assistant to ask what to inspect, change, or verify next.
+8. Export the generated context package for agents or future handoff.
 
 ## Demo Pages
 
@@ -35,7 +37,23 @@ The graph is not just a dependency chart. Nodes explain what each part owns, why
 
 Large inherited systems are hard because the important knowledge is spread across code, docs, config, queues, third-party APIs, and tribal memory. Atlas tries to make that shape visible. It shows what talks to what, which links are risky, and which conclusions are confirmed versus inferred.
 
-The same scan powers both the visual map and the markdown export, so humans and agents work from the same model instead of separate guesses.
+The same scan powers the visual map, markdown export, and handoff assistant, so humans and agents work from the same model instead of separate guesses.
+
+## Handoff Assistant
+
+The Explore page includes a Handoff assistant panel. It is intentionally not a generic chatbot: before calling Backboard it retrieves deterministic local context from SQLite, including workspace graph summaries, relevant repo scans, selected nodes or edges, graph neighborhoods, evidence snippets, generated context markdown, previous chat messages, and locally indexed Backboard memory facts.
+
+Use it for questions like:
+
+- "What does a new developer need to know before taking over this repo?"
+- "What should a new developer know before changing this module?"
+- "What is risky about this connection for a handoff?"
+- "How do these repos connect for someone inheriting unfinished work?"
+- "Show me evidence for that."
+
+Answers are expected to cite retrieved evidence when making architecture or handoff claims. If evidence is weak or absent, the assistant should say that the claim is inferred or uncertain, or: "I do not have evidence for that in the scanned repos yet."
+
+Backboard memory is reused at the Atlas workspace level. Atlas stores one assistant id per workspace and one Backboard thread per Atlas chat session. Durable memory writes are limited to evidence-backed repo/system/task handoff facts, include stable evidence ids plus commit/repo metadata, and record memory write errors in SQLite instead of failing silently.
 
 ## Tech Stack
 
@@ -99,6 +117,23 @@ The default API URL is `http://127.0.0.1:3001`. SQLite is stored at
 - `GET /api/scans/:scanId/context`
 - `GET /api/scans/:scanId/handoff`
 - `GET /api/scans/:scanId/export`
+- `POST /api/chat/sessions`
+- `GET /api/chat/sessions/:sessionId`
+- `GET /api/chat/sessions/:sessionId/messages`
+- `POST /api/chat/sessions/:sessionId/messages`
+- `POST /api/chat/sessions/:sessionId/memory-sync`
+
+### Handoff API Example
+
+```bash
+curl -s -X POST http://127.0.0.1:3001/api/chat/sessions \
+  -H 'Content-Type: application/json' \
+  -d '{"title":"Unfinished PR handoff"}'
+
+curl -s -X POST http://127.0.0.1:3001/api/chat/sessions/<session-id>/messages \
+  -H 'Content-Type: application/json' \
+  -d '{"content":"What does a new developer need to know before taking over this repo?","scanId":"<scan-id>"}'
+```
 
 The export package includes:
 
@@ -127,6 +162,7 @@ Frontend checks:
 
 ```bash
 cd web
+npx tsc -p tsconfig.json --noEmit
 npm run lint
 npm run build
 ```
@@ -148,3 +184,19 @@ Those repos are small public JS/TS repositories with a package-level
 relationship: `fastify-autoload` depends on the `fastify-plugin` package
 produced by `fastify-plugin`. Atlas uses that dependency declaration as
 evidence for a supported cross-repo workspace graph connection.
+
+Real handoff E2E verification also requires `BACKBOARD_API_KEY`:
+
+```bash
+cd api
+npm run test:e2e
+```
+
+The Playwright config loads `.env` from the repository root and `api/.env`
+without printing secret values, so the command above uses the same documented
+environment path as local scans. The suite starts the backend and frontend on
+isolated local ports, enables the optional API bearer-token guard with a dummy
+E2E token, verifies missing/invalid auth rejection for scan and chat routes,
+initializes SQLite, scans public repos, calls the real Backboard API, verifies
+stored handoff answers and memory behavior, and drives node and edge deep dives
+in the Explore UI.

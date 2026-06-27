@@ -3,6 +3,12 @@ import path from "node:path";
 import Database from "better-sqlite3";
 import type {
   BackboardSynthesis,
+  ChatCitation,
+  ChatContextBundle,
+  DurableMemoryFact,
+  ChatMessageRecord,
+  ChatRole,
+  ChatSessionRecord,
   Evidence,
   GraphData,
   GraphLink,
@@ -28,6 +34,18 @@ function parseJson<T>(value: string | null | undefined, fallback: T): T {
 
 function json(value: unknown): string {
   return JSON.stringify(value ?? null);
+}
+
+function isEvidenceBackedDurableFact(value: DurableMemoryFact): boolean {
+  return Boolean(
+    value?.fact?.trim() &&
+      value.commitSha &&
+      value.repo &&
+      Array.isArray(value.evidenceIds) &&
+      value.evidenceIds.length > 0 &&
+      Array.isArray(value.evidenceRefs) &&
+      value.evidenceRefs.length > 0,
+  );
 }
 
 function ensureColumn(db: SqliteDatabase, tableName: string, columnName: string, definition: string): void {
@@ -157,8 +175,35 @@ export function migrate(db: SqliteDatabase): void {
       message_id TEXT,
       memory_mode TEXT,
       memory_operation_id TEXT,
+      memory_facts_json TEXT,
       request_summary TEXT NOT NULL,
       response_json TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS chat_sessions (
+      id TEXT PRIMARY KEY,
+      workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+      title TEXT NOT NULL,
+      assistant_id TEXT NOT NULL,
+      thread_id TEXT,
+      selected_node_id TEXT,
+      selected_edge_id TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS chat_messages (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
+      role TEXT NOT NULL,
+      content TEXT NOT NULL,
+      context_json TEXT,
+      citations_json TEXT NOT NULL,
+      backboard_run_id TEXT,
+      backboard_message_id TEXT,
+      memory_operation_id TEXT,
+      memory_error TEXT,
       created_at TEXT NOT NULL
     );
 
@@ -171,8 +216,13 @@ export function migrate(db: SqliteDatabase): void {
     CREATE INDEX IF NOT EXISTS idx_edges_stable_id ON edges(stable_id);
     CREATE INDEX IF NOT EXISTS idx_evidence_subject ON evidence(subject_type, subject_stable_id);
     CREATE INDEX IF NOT EXISTS idx_evidence_stable_id ON evidence(stable_id);
+    CREATE INDEX IF NOT EXISTS idx_chat_sessions_workspace ON chat_sessions(workspace_id);
+    CREATE INDEX IF NOT EXISTS idx_chat_messages_session ON chat_messages(session_id, created_at);
   `);
+
   ensureColumn(db, "evidence", "stable_id", "TEXT");
+  ensureColumn(db, "chat_messages", "memory_error", "TEXT");
+  ensureColumn(db, "backboard_records", "memory_facts_json", "TEXT");
 }
 
 export class AtlasRepository {
@@ -493,12 +543,13 @@ export class AtlasRepository {
     backboard: BackboardSynthesis;
     requestSummary: string;
   }): void {
+    const durableFacts = (input.backboard.durableFacts ?? []).filter(isEvidenceBackedDurableFact);
     this.db
       .prepare(`
         INSERT INTO backboard_records
-          (workspace_id, repository_id, scan_id, assistant_id, thread_id, run_id, message_id, memory_mode, memory_operation_id, request_summary, response_json, created_at)
+          (workspace_id, repository_id, scan_id, assistant_id, thread_id, run_id, message_id, memory_mode, memory_operation_id, memory_facts_json, request_summary, response_json, created_at)
         VALUES
-          (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `)
       .run(
         input.workspaceId,
@@ -510,14 +561,160 @@ export class AtlasRepository {
         input.backboard.messageId ?? null,
         input.backboard.memoryMode,
         input.backboard.memoryOperationId ?? null,
+        durableFacts.length > 0 ? json(durableFacts) : null,
         input.requestSummary,
         json(input.backboard.responseJson),
         nowIso(),
       );
   }
 
+  createChatSession(input: {
+    id: string;
+    workspaceId: string;
+    title: string;
+    assistantId: string;
+    threadId?: string | null;
+    selectedNodeId?: string | null;
+    selectedEdgeId?: string | null;
+  }): ChatSessionRecord {
+    const now = nowIso();
+    this.db
+      .prepare(`
+        INSERT INTO chat_sessions
+          (id, workspace_id, title, assistant_id, thread_id, selected_node_id, selected_edge_id, created_at, updated_at)
+        VALUES
+          (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+      .run(
+        input.id,
+        input.workspaceId,
+        input.title,
+        input.assistantId,
+        input.threadId ?? null,
+        input.selectedNodeId ?? null,
+        input.selectedEdgeId ?? null,
+        now,
+        now,
+      );
+    return this.getChatSession(input.id)!;
+  }
+
+  getChatSession(sessionId: string): ChatSessionRecord | null {
+    const row = this.db.prepare("SELECT * FROM chat_sessions WHERE id = ?").get(sessionId) as ChatSessionRow | undefined;
+    return row ? chatSessionFromRow(row) : null;
+  }
+
+  updateChatSessionThread(sessionId: string, threadId: string): void {
+    this.db
+      .prepare("UPDATE chat_sessions SET thread_id = ?, updated_at = ? WHERE id = ?")
+      .run(threadId, nowIso(), sessionId);
+  }
+
+  updateChatSessionSelection(sessionId: string, selection: { selectedNodeId?: string | null; selectedEdgeId?: string | null }): void {
+    const current = this.getChatSession(sessionId);
+    if (!current) return;
+    const selectedNodeId = Object.prototype.hasOwnProperty.call(selection, "selectedNodeId")
+      ? selection.selectedNodeId ?? null
+      : current.selectedNodeId ?? null;
+    const selectedEdgeId = Object.prototype.hasOwnProperty.call(selection, "selectedEdgeId")
+      ? selection.selectedEdgeId ?? null
+      : current.selectedEdgeId ?? null;
+    this.db
+      .prepare("UPDATE chat_sessions SET selected_node_id = ?, selected_edge_id = ?, updated_at = ? WHERE id = ?")
+      .run(selectedNodeId, selectedEdgeId, nowIso(), sessionId);
+  }
+
+  addChatMessage(input: {
+    id: string;
+    sessionId: string;
+    role: ChatRole;
+    content: string;
+    context?: ChatContextBundle | null;
+    citations?: ChatCitation[];
+    backboardRunId?: string | null;
+    backboardMessageId?: string | null;
+    memoryOperationId?: string | null;
+    memoryError?: string | null;
+  }): ChatMessageRecord {
+    const now = nowIso();
+    this.db
+      .prepare(`
+        INSERT INTO chat_messages
+          (id, session_id, role, content, context_json, citations_json, backboard_run_id, backboard_message_id, memory_operation_id, memory_error, created_at)
+        VALUES
+          (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+      .run(
+        input.id,
+        input.sessionId,
+        input.role,
+        input.content,
+        input.context ? json(input.context) : null,
+        json(input.citations ?? []),
+        input.backboardRunId ?? null,
+        input.backboardMessageId ?? null,
+        input.memoryOperationId ?? null,
+        input.memoryError ?? null,
+        now,
+      );
+    this.db.prepare("UPDATE chat_sessions SET updated_at = ? WHERE id = ?").run(now, input.sessionId);
+    return this.getChatMessage(input.id)!;
+  }
+
+  getChatMessage(messageId: string): ChatMessageRecord | null {
+    const row = this.db.prepare("SELECT * FROM chat_messages WHERE id = ?").get(messageId) as ChatMessageRow | undefined;
+    return row ? chatMessageFromRow(row) : null;
+  }
+
+  updateChatMessageMemoryOperation(messageId: string, memoryOperationId: string): ChatMessageRecord | null {
+    this.db
+      .prepare("UPDATE chat_messages SET memory_operation_id = ?, memory_error = NULL WHERE id = ?")
+      .run(memoryOperationId, messageId);
+    return this.getChatMessage(messageId);
+  }
+
+  listChatMessages(sessionId: string, limit = 80): ChatMessageRecord[] {
+    const rows = this.db
+      .prepare(`
+        SELECT *
+        FROM chat_messages
+        WHERE session_id = ?
+        ORDER BY created_at DESC
+        LIMIT ?
+      `)
+      .all(sessionId, limit) as ChatMessageRow[];
+    return rows.reverse().map(chatMessageFromRow);
+  }
+
+  listBackboardMemoryFacts(workspaceId: string, limit = 12): string[] {
+    const rows = this.db
+      .prepare(`
+        SELECT memory_operation_id, memory_facts_json
+        FROM backboard_records
+        WHERE workspace_id = ?
+          AND memory_operation_id IS NOT NULL
+          AND memory_facts_json IS NOT NULL
+        ORDER BY created_at DESC
+        LIMIT ?
+      `)
+      .all(workspaceId, limit) as Array<{ memory_operation_id: string | null; memory_facts_json: string | null }>;
+    const facts: string[] = [];
+    for (const row of rows) {
+      const durableFacts = parseJson<DurableMemoryFact[]>(row.memory_facts_json, []).filter(isEvidenceBackedDurableFact);
+      for (const fact of durableFacts) {
+        const evidence = fact.evidenceIds.slice(0, 4).join(", ");
+        const location = fact.evidenceRefs[0]
+          ? `${fact.evidenceRefs[0].filePath}:L${fact.evidenceRefs[0].lineStart}`
+          : "evidence-indexed scan context";
+        facts.push(`${fact.fact} (repo ${fact.repo}; commit ${fact.commitSha}; evidence ${evidence}; ${location}; memory ${row.memory_operation_id})`);
+        if (facts.length >= limit) return facts;
+      }
+    }
+    return facts;
+  }
+
   countTable(tableName: string): number {
-    const allowed = new Set(["repositories", "scans", "nodes", "edges", "evidence", "backboard_records"]);
+    const allowed = new Set(["repositories", "scans", "nodes", "edges", "evidence", "backboard_records", "chat_sessions", "chat_messages"]);
     if (!allowed.has(tableName)) throw new Error(`Unsupported table count: ${tableName}`);
     const row = this.db.prepare(`SELECT COUNT(*) AS count FROM ${tableName}`).get() as { count: number };
     return row.count;
@@ -563,6 +760,32 @@ interface ScanEventRow {
   created_at: string;
 }
 
+interface ChatSessionRow {
+  id: string;
+  workspace_id: string;
+  title: string;
+  assistant_id: string;
+  thread_id: string | null;
+  selected_node_id: string | null;
+  selected_edge_id: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+interface ChatMessageRow {
+  id: string;
+  session_id: string;
+  role: ChatRole;
+  content: string;
+  context_json: string | null;
+  citations_json: string;
+  backboard_run_id: string | null;
+  backboard_message_id: string | null;
+  memory_operation_id: string | null;
+  memory_error: string | null;
+  created_at: string;
+}
+
 function repositoryFromRow(row: RepositoryRow): RepositoryRecord {
   return {
     id: row.id,
@@ -575,6 +798,36 @@ function repositoryFromRow(row: RepositoryRow): RepositoryRecord {
     lastCommitSha: row.last_commit_sha,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+  };
+}
+
+function chatSessionFromRow(row: ChatSessionRow): ChatSessionRecord {
+  return {
+    id: row.id,
+    workspaceId: row.workspace_id,
+    title: row.title,
+    assistantId: row.assistant_id,
+    threadId: row.thread_id,
+    selectedNodeId: row.selected_node_id,
+    selectedEdgeId: row.selected_edge_id,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function chatMessageFromRow(row: ChatMessageRow): ChatMessageRecord {
+  return {
+    id: row.id,
+    sessionId: row.session_id,
+    role: row.role,
+    content: row.content,
+    context: parseJson<ChatContextBundle | null>(row.context_json, null),
+    citations: parseJson<ChatCitation[]>(row.citations_json, []),
+    backboardRunId: row.backboard_run_id,
+    backboardMessageId: row.backboard_message_id,
+    memoryOperationId: row.memory_operation_id,
+    memoryError: row.memory_error,
+    createdAt: row.created_at,
   };
 }
 
